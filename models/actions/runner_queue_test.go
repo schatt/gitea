@@ -124,14 +124,20 @@ func TestFindRunningTasksByRunnerIDs(t *testing.T) {
 	running.GenerateAndFillToken()
 	require.NoError(t, db.Insert(t.Context(), running))
 
+	cancelling := &ActionTask{RunnerID: runner.ID, Status: StatusCancelling, RepoID: 1, JobID: 3}
+	cancelling.GenerateAndFillToken()
+	require.NoError(t, db.Insert(t.Context(), cancelling))
+
 	finished := &ActionTask{RunnerID: runner.ID, Status: StatusSuccess, RepoID: 1, JobID: 2}
 	finished.GenerateAndFillToken()
 	require.NoError(t, db.Insert(t.Context(), finished))
 
 	found, err := FindRunningTasksByRunnerIDs(t.Context(), []int64{runner.ID, other.ID})
 	require.NoError(t, err)
-	require.Len(t, found[runner.ID], 1)
-	assert.Equal(t, running.ID, found[runner.ID][0].ID)
+	require.Len(t, found[runner.ID], 2) // running and cancelling both still occupy the runner
+	assert.ElementsMatch(t,
+		[]int64{running.ID, cancelling.ID},
+		[]int64{found[runner.ID][0].ID, found[runner.ID][1].ID})
 	assert.Empty(t, found[other.ID])
 
 	found, err = FindRunningTasksByRunnerIDs(t.Context(), nil)
