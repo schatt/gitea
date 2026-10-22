@@ -12,6 +12,9 @@ import (
 
 	actions_model "gitea.dev/models/actions"
 	"gitea.dev/models/db"
+	access_model "gitea.dev/models/perm/access"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unit"
 	"gitea.dev/modules/log"
 	"gitea.dev/modules/setting"
 	"gitea.dev/modules/templates"
@@ -203,7 +206,64 @@ func runnerListRows(ctx *context.Context, runners []*actions_model.ActionRunner)
 		rows[i].RunningTasks = byRunner[rows[i].ID]
 		rows[i].WaitingQueues = waitingByRunner[rows[i].ID]
 	}
+	if err := filterRunnerListRowsByRepoAccess(ctx, rows); err != nil {
+		return nil, err
+	}
 	return rows, nil
+}
+
+// filterRunnerListRowsByRepoAccess drops pills whose repository the doer
+// cannot read Actions in. Available (org/global) runners are listed on repo
+// and user/org pages too, so runner scope alone must not disclose other
+// repositories' job names or queue sizes.
+func filterRunnerListRowsByRepoAccess(ctx *context.Context, rows []runnerListRow) error {
+	readable := map[int64]bool{}
+	canRead := func(repo *repo_model.Repository) (bool, error) {
+		if repo == nil {
+			return true, nil // nothing to disclose; the template only shows #jobID
+		}
+		if v, ok := readable[repo.ID]; ok {
+			return v, nil
+		}
+		perm, err := access_model.GetDoerRepoPermission(ctx, repo, ctx.Doer)
+		if err != nil {
+			return false, err
+		}
+		v := perm.CanRead(unit.TypeActions)
+		readable[repo.ID] = v
+		return v, nil
+	}
+
+	for i := range rows {
+		tasks := rows[i].RunningTasks[:0]
+		for _, task := range rows[i].RunningTasks {
+			var repo *repo_model.Repository
+			if task.Job != nil && task.Job.Run != nil {
+				repo = task.Job.Run.Repo
+			}
+			ok, err := canRead(repo)
+			if err != nil {
+				return err
+			}
+			if ok {
+				tasks = append(tasks, task)
+			}
+		}
+		rows[i].RunningTasks = tasks
+
+		queues := rows[i].WaitingQueues[:0]
+		for _, q := range rows[i].WaitingQueues {
+			ok, err := canRead(q.Repo)
+			if err != nil {
+				return err
+			}
+			if ok {
+				queues = append(queues, q)
+			}
+		}
+		rows[i].WaitingQueues = queues
+	}
+	return nil
 }
 
 // RunnersEdit renders runner edit page for repository level
