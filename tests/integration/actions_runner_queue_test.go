@@ -63,10 +63,10 @@ func TestActionsRunnerQueueList(t *testing.T) {
 	assert.Contains(t, body, "org3/repo3 · queue-running-job")
 	assert.Contains(t, body, "org3/repo3 1")
 
-	// user2 cannot read private org3/repo3. The global runner is still listed
-	// on repo1's runners page, but its repo3 pills must not leak.
-	user2 := loginUser(t, "user2")
-	body = user2.MakeRequest(t, NewRequest(t, "GET", "/user2/repo1/settings/actions/runners"), http.StatusOK).Body.String()
+	// user5 is not on org3; private repo3 Actions must not leak via the global
+	// runner that still appears on user5/repo4's runners page (WithAvailable).
+	user5 := loginUser(t, "user5")
+	body = user5.MakeRequest(t, NewRequest(t, "GET", "/user5/repo4/settings/actions/runners"), http.StatusOK).Body.String()
 	assert.Contains(t, body, "queue-global-runner")
 	assert.NotContains(t, body, "queue-running-job")
 	assert.NotContains(t, body, "org3/repo3")

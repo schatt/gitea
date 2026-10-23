@@ -212,54 +212,93 @@ func runnerListRows(ctx *context.Context, runners []*actions_model.ActionRunner)
 	return rows, nil
 }
 
-// filterRunnerListRowsByRepoAccess drops pills whose repository the doer
-// cannot read Actions in. Available (org/global) runners are listed on repo
-// and user/org pages too, so runner scope alone must not disclose other
-// repositories' job names or queue sizes.
-func filterRunnerListRowsByRepoAccess(ctx *context.Context, rows []runnerListRow) error {
+// actionsRepoReadable returns whether the doer can read Actions in repoID.
+// Unknown/missing repos are denied so a failed attribute load cannot leak
+// job names that the template still renders from task.Job.
+func actionsRepoReadable(ctx *context.Context) func(repoID int64, repo *repo_model.Repository) (bool, error) {
 	readable := map[int64]bool{}
-	canRead := func(repo *repo_model.Repository) (bool, error) {
-		if repo == nil {
-			return true, nil // nothing to disclose; the template only shows #jobID
+	return func(repoID int64, repo *repo_model.Repository) (bool, error) {
+		if repo != nil {
+			repoID = repo.ID
 		}
-		if v, ok := readable[repo.ID]; ok {
+		if repoID <= 0 {
+			return false, nil
+		}
+		if v, ok := readable[repoID]; ok {
 			return v, nil
+		}
+		if repo == nil {
+			var err error
+			repo, err = repo_model.GetRepositoryByID(ctx, repoID)
+			if err != nil {
+				if repo_model.IsErrRepoNotExist(err) {
+					readable[repoID] = false
+					return false, nil
+				}
+				return false, err
+			}
 		}
 		perm, err := access_model.GetDoerRepoPermission(ctx, repo, ctx.Doer)
 		if err != nil {
 			return false, err
 		}
 		v := perm.CanRead(unit.TypeActions)
-		readable[repo.ID] = v
+		readable[repoID] = v
 		return v, nil
 	}
+}
 
+func filterTasksByRepoAccess(canRead func(int64, *repo_model.Repository) (bool, error), tasks []*actions_model.ActionTask) ([]*actions_model.ActionTask, error) {
+	out := tasks[:0]
+	for _, task := range tasks {
+		var repo *repo_model.Repository
+		if task.Job != nil && task.Job.Run != nil {
+			repo = task.Job.Run.Repo
+		}
+		ok, err := canRead(task.RepoID, repo)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out = append(out, task)
+		}
+	}
+	return out, nil
+}
+
+func filterQueuesByRepoAccess(canRead func(int64, *repo_model.Repository) (bool, error), queues []actions_model.RunnerRepoQueue) ([]actions_model.RunnerRepoQueue, error) {
+	out := queues[:0]
+	for _, q := range queues {
+		var repoID int64
+		if q.Repo != nil {
+			repoID = q.Repo.ID
+		}
+		ok, err := canRead(repoID, q.Repo)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out = append(out, q)
+		}
+	}
+	return out, nil
+}
+
+// filterRunnerListRowsByRepoAccess drops pills whose repository the doer
+// cannot read Actions in. Available (org/global) runners are listed on repo
+// and user/org pages too, so runner scope alone must not disclose other
+// repositories' job names or queue sizes.
+func filterRunnerListRowsByRepoAccess(ctx *context.Context, rows []runnerListRow) error {
+	canRead := actionsRepoReadable(ctx)
 	for i := range rows {
-		tasks := rows[i].RunningTasks[:0]
-		for _, task := range rows[i].RunningTasks {
-			var repo *repo_model.Repository
-			if task.Job != nil && task.Job.Run != nil {
-				repo = task.Job.Run.Repo
-			}
-			ok, err := canRead(repo)
-			if err != nil {
-				return err
-			}
-			if ok {
-				tasks = append(tasks, task)
-			}
+		tasks, err := filterTasksByRepoAccess(canRead, rows[i].RunningTasks)
+		if err != nil {
+			return err
 		}
 		rows[i].RunningTasks = tasks
-
-		queues := rows[i].WaitingQueues[:0]
-		for _, q := range rows[i].WaitingQueues {
-			ok, err := canRead(q.Repo)
-			if err != nil {
-				return err
-			}
-			if ok {
-				queues = append(queues, q)
-			}
+		queues, err := filterQueuesByRepoAccess(canRead, rows[i].WaitingQueues)
+		if err != nil {
+			return err
 		}
 		rows[i].WaitingQueues = queues
 	}
@@ -316,6 +355,17 @@ func RunnersEdit(ctx *context.Context) {
 		ctx.ServerError("ListRunnerRepoQueues", err)
 		return
 	}
+	canRead := actionsRepoReadable(ctx)
+	runningTasks, err = filterTasksByRepoAccess(canRead, runningTasks)
+	if err != nil {
+		ctx.ServerError("filterRunningTasksByRepoAccess", err)
+		return
+	}
+	repoQueues, err = filterQueuesByRepoAccess(canRead, repoQueues)
+	if err != nil {
+		ctx.ServerError("filterRepoQueuesByRepoAccess", err)
+		return
+	}
 	repoQueueEmpty := "actions.runners.repo_queue.none"
 	if runner.RepoID == 0 && runner.OwnerID == 0 {
 		repoQueueEmpty = "actions.runners.repo_queue.none_global"
@@ -341,6 +391,11 @@ func RunnersEdit(ctx *context.Context) {
 
 	if err = actions_model.TaskList(tasks).LoadAttributes(ctx); err != nil {
 		ctx.ServerError("TasksLoadAttributes", err)
+		return
+	}
+	tasks, err = filterTasksByRepoAccess(canRead, tasks)
+	if err != nil {
+		ctx.ServerError("filterTasksByRepoAccess", err)
 		return
 	}
 
