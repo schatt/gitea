@@ -137,16 +137,15 @@ func WaitingQueuesByRunner(ctx context.Context, runners []*ActionRunner) (map[in
 		}
 	}
 
-	var cond builder.Cond = builder.Eq{"task_id": 0, "status": StatusWaiting, "is_reusable_caller": false}
+	var jobRepoIDs []int64
 	if !hasGlobal {
-		ids := make([]int64, 0, len(repoByID))
+		jobRepoIDs = make([]int64, 0, len(repoByID))
 		for id := range repoByID {
-			ids = append(ids, id)
+			jobRepoIDs = append(jobRepoIDs, id)
 		}
-		cond = cond.And(builder.In("repo_id", ids))
 	}
-	var jobs []*ActionRunJob
-	if err := db.GetEngine(ctx).Where(cond).Cols("repo_id", "runs_on").Find(&jobs); err != nil {
+	jobs, err := loadPickableWaitingJobs(ctx, jobRepoIDs)
+	if err != nil {
 		return nil, err
 	}
 	if len(jobs) == 0 {
@@ -222,33 +221,34 @@ func listRunnerScopeReposForOwnersAndRepos(ctx context.Context, ownerIDs, repoID
 func listRunnerScopeRepos(ctx context.Context, runner *ActionRunner) ([]*repo_model.Repository, error) {
 	// Same scope as CreateTaskForRunner: one repository, or every actions-enabled
 	// repository owned by the runner's user or organization.
-	cond := builder.NewCond().And(builder.Eq{"`repo_unit`.type": unit.TypeActions})
-	if runner.RepoID != 0 {
-		cond = cond.And(builder.Eq{"`repository`.id": runner.RepoID})
-	} else {
-		cond = cond.And(builder.Eq{"`repository`.owner_id": runner.OwnerID})
+	if runner.RepoID > 0 {
+		return listRunnerScopeReposForOwnersAndRepos(ctx, nil, []int64{runner.RepoID})
 	}
-	repoIDs := builder.Select("`repository`.id").From("repository").
-		Join("INNER", "repo_unit", "`repository`.id = `repo_unit`.repo_id").
-		Where(cond)
+	return listRunnerScopeReposForOwnersAndRepos(ctx, []int64{runner.OwnerID}, nil)
+}
 
-	var repos []*repo_model.Repository
-	err := db.GetEngine(ctx).Where(builder.In("id", repoIDs)).Find(&repos)
-	return repos, err
+// loadPickableWaitingJobs loads the jobs a runner could claim: waiting,
+// unclaimed and not a reusable-workflow caller. A nil repoIDs means all repos.
+func loadPickableWaitingJobs(ctx context.Context, repoIDs []int64) ([]*ActionRunJob, error) {
+	var cond builder.Cond = builder.Eq{"task_id": 0, "status": StatusWaiting, "is_reusable_caller": false}
+	if repoIDs != nil {
+		cond = cond.And(builder.In("repo_id", repoIDs))
+	}
+	var jobs []*ActionRunJob
+	err := db.GetEngine(ctx).Where(cond).Cols("repo_id", "runs_on").Find(&jobs)
+	return jobs, err
 }
 
 func countPickableWaitingJobs(ctx context.Context, runner *ActionRunner, repos []*repo_model.Repository) (map[int64]int, error) {
-	var cond builder.Cond = builder.Eq{"task_id": 0, "status": StatusWaiting, "is_reusable_caller": false}
+	var repoIDs []int64
 	if len(repos) > 0 {
-		ids := make([]int64, len(repos))
+		repoIDs = make([]int64, len(repos))
 		for i, repo := range repos {
-			ids[i] = repo.ID
+			repoIDs[i] = repo.ID
 		}
-		cond = cond.And(builder.In("repo_id", ids))
 	}
-
-	var jobs []*ActionRunJob
-	if err := db.GetEngine(ctx).Where(cond).Cols("repo_id", "runs_on").Find(&jobs); err != nil {
+	jobs, err := loadPickableWaitingJobs(ctx, repoIDs)
+	if err != nil {
 		return nil, err
 	}
 
@@ -261,7 +261,8 @@ func countPickableWaitingJobs(ctx context.Context, runner *ActionRunner, repos [
 	return counts, nil
 }
 
-// FindRunningTasksByRunnerIDs returns tasks with status running, grouped by runner.
+// FindRunningTasksByRunnerIDs returns tasks that still occupy a runner
+// (running or cancelling), grouped by runner.
 // An empty runnerIDs does not mean "every runner".
 func FindRunningTasksByRunnerIDs(ctx context.Context, runnerIDs []int64) (map[int64][]*ActionTask, error) {
 	found := make(map[int64][]*ActionTask, len(runnerIDs))
@@ -271,7 +272,7 @@ func FindRunningTasksByRunnerIDs(ctx context.Context, runnerIDs []int64) (map[in
 
 	var tasks []*ActionTask
 	if err := db.GetEngine(ctx).
-		Where(builder.Eq{"status": StatusRunning}).
+		Where(builder.In("status", []Status{StatusRunning, StatusCancelling})).
 		In("runner_id", runnerIDs).
 		Find(&tasks); err != nil {
 		return nil, err
